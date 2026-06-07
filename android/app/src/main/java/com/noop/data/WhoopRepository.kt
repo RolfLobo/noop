@@ -2,6 +2,7 @@ package com.noop.data
 
 import android.content.Context
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 
 /**
  * Decoded streams to persist in one transaction. Android mirror of the Swift `Streams`
@@ -176,6 +177,50 @@ class WhoopRepository(private val dao: WhoopDao) {
     /** All cached daily metrics for a device, oldest first. Feeds com.noop.analytics.IllnessWatch. */
     suspend fun days(deviceId: String): List<DailyMetric> = dao.days(deviceId)
 
+    // MARK: - Merged reads (imported source wins per day; computed "-noop" gap-fills)
+    //
+    // Mirrors macOS Repository.mergeDaily / mergeSleep: the IntelligenceEngine persists
+    // on-device scores under "<deviceId>-noop"; the dashboard should see BOTH sources so
+    // a strap-only user still gets a populated dashboard, while a real WHOOP import always
+    // wins on the days it covers. The screens point their "my-whoop" reads at these merged
+    // variants (the least invasive correct approach — no DAO/schema change, and the per-day
+    // precedence lives in one place).
+
+    /** The computed-source id for a given imported [deviceId] (e.g. "my-whoop" → "my-whoop-noop"). */
+    fun computedDeviceId(deviceId: String): String = "$deviceId-noop"
+
+    /**
+     * All cached daily metrics for [deviceId], oldest first, MERGED with the on-device
+     * computed scores from "<deviceId>-noop". Imported rows win per day; computed rows
+     * fill the days the import doesn't cover. Port of macOS Repository.mergeDaily.
+     */
+    suspend fun daysMerged(deviceId: String): List<DailyMetric> =
+        mergeDaily(imported = dao.days(deviceId), computed = dao.days(computedDeviceId(deviceId)))
+
+    /**
+     * Reactive merged daily metrics (oldest first): imported [deviceId] rows win per day,
+     * computed "<deviceId>-noop" rows gap-fill. Emits whenever either source changes.
+     */
+    fun daysMergedFlow(deviceId: String): Flow<List<DailyMetric>> =
+        dao.daysFlow(deviceId).combine(dao.daysFlow(computedDeviceId(deviceId))) { imported, computed ->
+            mergeDaily(imported = imported, computed = computed)
+        }
+
+    /**
+     * Sleep sessions for [deviceId] in [from, to] (unix seconds) MERGED with the computed
+     * "<deviceId>-noop" sessions. Imported sessions win per night-end day; computed sessions
+     * gap-fill. Port of macOS Repository.mergeSleep. Sorted by startTs ascending.
+     */
+    suspend fun sleepSessionsMerged(
+        deviceId: String,
+        from: Long,
+        to: Long,
+        limit: Int = DEFAULT_LIMIT,
+    ): List<SleepSession> = mergeSleep(
+        imported = dao.sleepSessions(deviceId, from, to, limit),
+        computed = dao.sleepSessions(computedDeviceId(deviceId), from, to, limit),
+    )
+
     /** Cached daily metrics for the inclusive day range [from, to] (YYYY-MM-DD), oldest first. */
     suspend fun dailyMetrics(deviceId: String, from: String, to: String): List<DailyMetric> =
         dao.dailyMetricsRange(deviceId, from, to)
@@ -197,6 +242,38 @@ class WhoopRepository(private val dao: WhoopDao) {
 
         /** Build a repository backed by the process-wide singleton database. */
         fun from(context: Context): WhoopRepository = WhoopRepository(WhoopDatabase.get(context))
+
+        /**
+         * Imported daily rows win per day; computed rows fill the days the import doesn't
+         * cover. Returns oldest→newest by day string (lexicographic = chronological for
+         * YYYY-MM-DD). Port of macOS Repository.mergeDaily.
+         */
+        internal fun mergeDaily(
+            imported: List<DailyMetric>,
+            computed: List<DailyMetric>,
+        ): List<DailyMetric> {
+            val byDay = LinkedHashMap<String, DailyMetric>()
+            for (d in computed) byDay[d.day] = d // computed first…
+            for (d in imported) byDay[d.day] = d // …import overwrites, so a real WHOOP import always wins
+            return byDay.values.sortedBy { it.day }
+        }
+
+        /**
+         * Same precedence for sleep sessions, keyed by the UTC day the night ends on.
+         * Port of macOS Repository.mergeSleep (the macOS keyer used the local tz; this
+         * port keys on UTC for consistency with AnalyticsEngine's UTC day attribution).
+         */
+        internal fun mergeSleep(
+            imported: List<SleepSession>,
+            computed: List<SleepSession>,
+        ): List<SleepSession> {
+            fun endDay(s: SleepSession): String =
+                com.noop.analytics.AnalyticsEngine.dayString(s.endTs)
+            val byDay = LinkedHashMap<String, SleepSession>()
+            for (s in computed) byDay[endDay(s)] = s
+            for (s in imported) byDay[endDay(s)] = s
+            return byDay.values.sortedBy { it.startTs }
+        }
     }
 }
 

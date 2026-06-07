@@ -20,13 +20,25 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
+import com.noop.data.HrRow
+import com.noop.data.RrRow
+import com.noop.data.StreamBatch
+import com.noop.data.StreamPersistence
+import com.noop.data.WhoopRepository
 import com.noop.protocol.CommandNumber
 import com.noop.protocol.DeviceFamily
 import com.noop.protocol.Framing
 import com.noop.protocol.Reassembler
+import com.noop.protocol.Streams
+import com.noop.protocol.extractStreams
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 
@@ -89,7 +101,23 @@ data class LiveState(
  *   - Every android.bluetooth call below is annotated @SuppressLint("MissingPermission"); the
  *     ViewModel/Activity owns the permission request and must not call into here until granted.
  */
-class WhoopBleClient(private val context: Context) {
+class WhoopBleClient(
+    private val context: Context,
+    /**
+     * Local store the decoded live + historical streams are persisted into. Defaults to the
+     * process-wide Room-backed repository so the existing `WhoopBleClient(context)` call site keeps
+     * working unchanged. The Swift `BLEManager` wires a `WhoopStore`-backed `Collector`/`Backfiller`
+     * the same way (BLEManager.bootstrapStore).
+     */
+    private val repository: WhoopRepository = WhoopRepository.from(context),
+    /**
+     * Stable device id; all rows are stamped with this. "my-whoop" matches the Swift default and
+     * the rest of the Android app (AppViewModel reads "my-whoop").
+     */
+    private val deviceId: String = "my-whoop",
+    /** Durable trim-cursor store for the offload safe-trim watermark (see [Backfiller]). */
+    private val cursorStore: TrimCursorStore = PrefsTrimCursorStore(context),
+) {
 
     companion object {
         private const val TAG = "WhoopBleClient"
@@ -119,6 +147,58 @@ class WhoopBleClient(private val context: Context) {
 
         /** Auto-rescan delay after an unintentional disconnect (BLEManager: "rescanning in 3s"). */
         private const val RECONNECT_DELAY_MS = 3_000L
+
+        // MARK: Live-persistence cadence (port of Swift CollectorPolicy.default).
+        /** Flush the live buffer after this many frames OR [FLUSH_MAX_INTERVAL_MS], whichever first. */
+        private const val FLUSH_MAX_FRAMES = 64
+        private const val FLUSH_MAX_INTERVAL_MS = 30_000L
+
+        // MARK: Historical-offload timers (ported from BLEManager.swift, same constants).
+        /** Periodic re-offload of the type-47 store while connected+bonded. 900s = 15 min (matches WHOOP). */
+        private const val BACKFILL_INTERVAL_MS = 900_000L
+        /**
+         * Idle watchdog: if no genuine offload frame arrives for this long mid-session, end the
+         * session (the durable strap_trim cursor means the next session resumes where we left off).
+         * Generous (60s, not 20s) because the type-43 raw flood eats BLE airtime between chunks.
+         */
+        private const val BACKFILL_IDLE_TIMEOUT_MS = 60_000L
+        /** Deferral before the first connect-time offload, so SET_CLOCK/GET_DATA_RANGE round-trip first. */
+        private const val INITIAL_BACKFILL_DELAY_MS = 1_500L
+
+        /**
+         * True when a frame is part of the historical offload (HISTORICAL_DATA=47, EVENT=48,
+         * METADATA=49, CONSOLE_LOGS=50) rather than the live stream (REALTIME_DATA=40,
+         * REALTIME_RAW_DATA=43). The live type-43 raw flood streams continuously and unprompted on
+         * this firmware, so the backfill idle-watchdog must NOT be re-armed by it — only by genuine
+         * offload progress. Port of Swift `BLEManager.isOffloadFrame`.
+         */
+        fun isOffloadFrame(frame: ByteArray): Boolean {
+            if (frame.size <= 4) return false
+            return when (frame[4].toInt() and 0xFF) {
+                47, 48, 49, 50 -> true // HISTORICAL_DATA / EVENT / METADATA / CONSOLE_LOGS
+                else -> false // 40 REALTIME_DATA, 43 REALTIME_RAW_DATA (live flood)
+            }
+        }
+
+        /**
+         * Newest plausible-unix marker in a GET_DATA_RANGE response = the strap's newest stored
+         * record. Mirrors Swift `BLEManager.dataRangeNewestUnix`: scan u32 LE words in the response
+         * body (starts at frame[7], after [type,seq,cmd]), keep those in the unix range, return max.
+         */
+        fun dataRangeNewestUnix(frame: ByteArray): Long? {
+            if (frame.size <= 7) return null
+            var newest: Long? = null
+            var i = 7
+            while (i + 4 <= frame.size) {
+                val w = (frame[i].toLong() and 0xFFL) or
+                    ((frame[i + 1].toLong() and 0xFFL) shl 8) or
+                    ((frame[i + 2].toLong() and 0xFFL) shl 16) or
+                    ((frame[i + 3].toLong() and 0xFFL) shl 24)
+                if (w in 1_700_000_000L..1_900_000_000L) newest = maxOf(newest ?: 0L, w)
+                i += 4
+            }
+            return newest
+        }
     }
 
     // MARK: Published state — the single source of truth the UI observes.
@@ -154,6 +234,65 @@ class WhoopBleClient(private val context: Context) {
 
     /** All BLE work hops onto the main looper, matching CBCentralManager(queue: .main). */
     private val handler = Handler(Looper.getMainLooper())
+
+    // ====================================================================================
+    // MARK: Persistence + historical offload (NEW — ports BLEManager.swift Collector/Backfiller)
+    // ====================================================================================
+
+    /**
+     * Background scope for all DB writes (insert is a suspend Room call). SupervisorJob so one
+     * failed insert never cancels the others; IO dispatcher keeps DB work off the main looper.
+     * Cancelled in [shutdown].
+     */
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** The offload state machine. Ack callback writes HISTORICAL_DATA_RESULT (with response). */
+    private val backfiller = Backfiller(
+        repository = repository,
+        deviceId = deviceId,
+        cursorStore = cursorStore,
+        ackTrim = { trim, endData -> ackHistoricalChunk(trim, endData) },
+    )
+
+    /** True while a historical offload is in progress (offload frames route to the Backfiller). */
+    @Volatile
+    private var backfilling = false
+
+    /** Guards the once-per-connect initial offload kick (Swift `backfillStarted`). */
+    private var backfillStarted = false
+
+    /** Newest unix the strap reports having (from GET_DATA_RANGE); refreshed each connect. */
+    @Volatile
+    private var strapNewestTs: Long? = null
+
+    // --- Live-persistence buffer (port of Swift Collector: custom realtime/event/battery frames) ---
+
+    /**
+     * Live-persistence buffers, guarded by [collectorLock] (a plain monitor, NOT a coroutine Mutex,
+     * because frames are appended synchronously from the single-threaded GATT callback thread and
+     * only the suspend DB insert hops to [ioScope]). [batchStartedAtMs] tracks the flush interval.
+     */
+    private val collectorLock = Any()
+
+    /** Buffered complete custom-channel frames awaiting a batched decode+insert. */
+    private val liveBuffer = ArrayList<ByteArray>()
+    private var batchStartedAtMs = System.currentTimeMillis()
+
+    /** Standard 0x2A37 HR/RR buffer — the reliable, always-on stream (port of Collector.stdHR/stdRR). */
+    private val stdHr = ArrayList<HrRow>()
+    private val stdRr = ArrayList<RrRow>()
+
+    // --- Offload frame drain (preserves START/data/END arrival order; port of routeBackfillFrame) ---
+
+    /** Ordered queue of offload frames awaiting the serial Backfiller drain. */
+    private val backfillFrameQueue = ConcurrentLinkedQueue<ByteArray>()
+
+    @Volatile
+    private var backfillDraining = false
+
+    /** Periodic re-offload + idle-watchdog tokens (handler-posted; cancelled on disconnect). */
+    private val periodicBackfillRunnable = Runnable { triggerPeriodicBackfill() }
+    private val backfillTimeoutRunnable = Runnable { onBackfillTimeout() }
 
     /**
      * Pending outbound writes. Android's GATT stack allows ONE in-flight write at a time:
@@ -436,7 +575,28 @@ class WhoopBleClient(private val context: Context) {
                 // Reassemble (no-op for already-complete frames) then route each complete frame.
                 // Port of: for frame in reassembler.feed(bytes) { router.handle(frame:) }.
                 for (frame in reassembler.feed(bytes)) {
-                    handleFrame(frame)
+                    handleFrame(frame)              // UI (always) — port of router.handle(frame:)
+
+                    // Capture the strap's newest stored record from a GET_DATA_RANGE reply
+                    // (frame[6] == GET_DATA_RANGE.rawValue), feeding the liveness watchdog.
+                    if (frame.size > 6 && (frame[6].toInt() and 0xFF) == CommandNumber.GET_DATA_RANGE.rawValue) {
+                        dataRangeNewestUnix(frame)?.let { strapNewestTs = it }
+                    }
+
+                    // PERSISTENCE / OFFLOAD ROUTING — port of the didUpdateValueFor tail block.
+                    if (backfilling) {
+                        // Historical offload: route ONLY genuine offload frames (47/48/49/50) through
+                        // the serial drain (preserves chunk order) + re-arm the idle watchdog on them.
+                        // The live type-40/43 flood is dropped here (extractHistoricalStreams ignores
+                        // it; feeding it only delays each chunk's insert->trim-ack and stalls the strap).
+                        if (isOffloadFrame(frame)) {
+                            armBackfillTimeout()
+                            routeBackfillFrame(frame)
+                        }
+                    } else {
+                        // Live path: buffer the frame for a batched decode+insert (port of Collector.ingest).
+                        ingestLiveFrame(frame)
+                    }
                 }
             }
             else -> { /* ignore */ }
@@ -542,6 +702,10 @@ class WhoopBleClient(private val context: Context) {
         if (rr.isNotEmpty()) _state.value = _state.value.copy(rr = rr)
         // HR: accept only physiologically plausible values; reject 0/garbage (off-wrist).
         if (hr in 30..220) _state.value = _state.value.copy(heartRate = hr)
+
+        // Record it continuously — independent of the realtime stream or which screen is open.
+        // Port of BLEManager.parseStandardHR -> collector.ingestStandardHR(hr:rr:at:).
+        ingestStandardHr(hr, rr, (System.currentTimeMillis() / 1000L))
     }
 
     /** Single funnel for battery readings (port of LiveState.setBattery). */
@@ -570,6 +734,14 @@ class WhoopBleClient(private val context: Context) {
         send(CommandNumber.SEND_R10_R11_REALTIME, byteArrayOf(0))  // stop the type-43 realtime flood
         send(CommandNumber.GET_DATA_RANGE)                          // refresh stored range
         log("Connect handshake sent (hello/set-clock/get-clock/stop-raw/get-range)")
+
+        // Historical offload: the type-47 store is the PRIMARY metric source. Kick it once on connect
+        // (deferred so SET_CLOCK/GET_DATA_RANGE round-trip first, on a settled link — like the paced
+        // Mac prototype), then re-offload every BACKFILL_INTERVAL_MS. Port of the didWriteValueFor
+        // tail: asyncAfter(1.5s) { requestSync(.connect) } + startBackfillTimer().
+        backfillStarted = true
+        handler.postDelayed({ requestSync() }, INITIAL_BACKFILL_DELAY_MS)
+        startBackfillTimer()
     }
 
     /**
@@ -701,11 +873,206 @@ class WhoopBleClient(private val context: Context) {
     }
 
     // ====================================================================================
+    // MARK: Live persistence  (port of Collector.ingest / flush / ingestStandardHR / flushStandardHR)
+    // ====================================================================================
+
+    /**
+     * Buffer one complete custom-channel frame and flush on the cadence threshold. Port of
+     * `Collector.ingest`: append, then when the buffer hits [FLUSH_MAX_FRAMES] or
+     * [FLUSH_MAX_INTERVAL_MS] since the last flush, drain it. Unlike the Swift Collector this does
+     * NOT gate on a clock ref — the live realtime decode uses an identity clock (the strap rarely
+     * serves GET_CLOCK on this firmware) and REALTIME_DATA's `timestamp` is mapped through it; the
+     * historical store, which is the real metric source, carries its own unix ts and needs no clock.
+     */
+    private fun ingestLiveFrame(frame: ByteArray) {
+        val shouldFlush = synchronized(collectorLock) {
+            liveBuffer.add(frame)   // synchronous append preserves GATT-callback arrival order
+            liveBuffer.size >= FLUSH_MAX_FRAMES ||
+                (System.currentTimeMillis() - batchStartedAtMs) >= FLUSH_MAX_INTERVAL_MS
+        }
+        if (shouldFlush) ioScope.launch { flushLive() }
+    }
+
+    /**
+     * Decode the buffered live frames and persist them. Snapshot+clear under the lock BEFORE the
+     * suspend insert so concurrent ingests accumulate into the next batch (port of Collector.flush).
+     */
+    private suspend fun flushLive() {
+        val frames = synchronized(collectorLock) {
+            if (liveBuffer.isEmpty()) return
+            val snapshot = ArrayList(liveBuffer)
+            liveBuffer.clear()
+            batchStartedAtMs = System.currentTimeMillis()
+            snapshot
+        }
+        // Identity clock ref: REALTIME_DATA timestamps are device-epoch, but with device==wall the
+        // offset is a no-op. The dense, authoritative metric stream is the type-47 historical store
+        // (which carries real unix ts); this live path captures live REALTIME_DATA/EVENT/battery.
+        val now = (System.currentTimeMillis() / 1000L).toInt()
+        val parsed = frames.map { Framing.parseFrame(it, DeviceFamily.WHOOP4) }
+        val streams: Streams = extractStreams(parsed, deviceClockRef = now, wallClockRef = now)
+        val batch = StreamPersistence.toBatch(streams)
+        if (!batch.isEmpty) {
+            try {
+                repository.insert(batch, deviceId)
+            } catch (t: Throwable) {
+                // Re-buffer at the front so these frames retry on the next cadence (port of Collector).
+                synchronized(collectorLock) { liveBuffer.addAll(0, frames) }
+            }
+        }
+    }
+
+    /**
+     * Buffer one standard 0x2A37 reading (carries a wall-clock ts directly, no clock ref needed).
+     * Auto-flushes ~every 30 readings. Port of `Collector.ingestStandardHR`.
+     */
+    private fun ingestStandardHr(hr: Int, rr: List<Int>, ts: Long) {
+        val shouldFlush = synchronized(collectorLock) {
+            if (hr in 30..220) stdHr.add(HrRow(ts, hr))
+            for (r in rr) if (r in 250..3000) stdRr.add(RrRow(ts, r))
+            stdHr.size + stdRr.size >= 30
+        }
+        if (shouldFlush) ioScope.launch { flushStandardHr() }
+    }
+
+    /** Persist the buffered standard HR/RR. Re-buffers on failure. Port of `Collector.flushStandardHR`. */
+    private suspend fun flushStandardHr() {
+        val (hr, rr) = synchronized(collectorLock) {
+            if (stdHr.isEmpty() && stdRr.isEmpty()) return
+            val h = ArrayList(stdHr); val r = ArrayList(stdRr)
+            stdHr.clear(); stdRr.clear()
+            h to r
+        }
+        try {
+            repository.insert(StreamBatch(hr = hr, rr = rr), deviceId)
+        } catch (t: Throwable) {
+            synchronized(collectorLock) { stdHr.addAll(0, hr); stdRr.addAll(0, rr) }
+        }
+    }
+
+    // ====================================================================================
+    // MARK: Historical offload  (port of BLEManager backfill helpers + state machine)
+    // ====================================================================================
+
+    /**
+     * Start a historical-offload session: tell the state machine to begin, flip the routing flag,
+     * kick the strap with SEND_HISTORICAL_DATA, and arm the idle watchdog. Port of `beginBackfill`.
+     *
+     * Payload MUST be [0x00], NOT empty: verified on-device that this strap serves type-47 only with
+     * [0x00] (the Mac ground-truth offload uses [0x00] too). Plain offload — the strap streams
+     * HISTORY_START -> type-47 records -> HISTORY_END (acked) ... -> HISTORY_COMPLETE.
+     */
+    private fun beginBackfill() {
+        if (!connectHandshakeDone) {
+            log("Backfill: deferred — connect handshake not done yet")
+            return
+        }
+        if (backfilling) return
+        backfiller.begin()
+        backfilling = true
+        send(CommandNumber.SEND_HISTORICAL_DATA, byteArrayOf(0), withResponse = true)
+        armBackfillTimeout()
+        log("Backfill: session started — historical offload requested")
+    }
+
+    /**
+     * The single gated entry point for every historical-offload kick. Runs only when connected +
+     * bonded and NOT already mid-backfill. Port of `requestSync` minus the BackfillPolicy
+     * rate-limiter (see FLAG: the policy gate isn't ported here — the only triggers wired are the
+     * once-per-connect kick and the 900s periodic timer, which is itself the coarse rate limit).
+     */
+    private fun requestSync() {
+        if (!_state.value.connected || !_state.value.bonded || backfilling) return
+        beginBackfill()
+    }
+
+    /** Periodic-timer callback: re-runs the type-47 offload (the primary metric sync). */
+    private fun triggerPeriodicBackfill() {
+        requestSync()
+        // Re-arm regardless so the cadence continues for the life of the connection.
+        handler.postDelayed(periodicBackfillRunnable, BACKFILL_INTERVAL_MS)
+    }
+
+    private fun startBackfillTimer() {
+        handler.removeCallbacks(periodicBackfillRunnable)
+        handler.postDelayed(periodicBackfillRunnable, BACKFILL_INTERVAL_MS)
+    }
+
+    private fun stopBackfillTimer() {
+        handler.removeCallbacks(periodicBackfillRunnable)
+    }
+
+    /**
+     * Feed an offload frame to the Backfiller preserving exact arrival order. Frames are appended
+     * synchronously (callback order) and drained sequentially by a single coroutine, so START/data/
+     * END chunk assembly is never reordered. Port of `routeBackfillFrame` + the serial drain task.
+     */
+    private fun routeBackfillFrame(frame: ByteArray) {
+        backfillFrameQueue.add(frame)
+        if (backfillDraining) return
+        backfillDraining = true
+        ioScope.launch {
+            while (true) {
+                val f = backfillFrameQueue.poll() ?: break
+                backfiller.ingest(f)
+                // If the Backfiller consumed all historical data, exit the session cleanly.
+                if (backfilling && !backfiller.isBackfilling) {
+                    handler.post { exitBackfilling("HISTORY_COMPLETE") }
+                }
+            }
+            backfillDraining = false
+        }
+    }
+
+    /**
+     * Re-arm the idle watchdog. Called on every offload frame during backfill; if the strap goes
+     * silent the timer fires and we exit the session. Port of `armBackfillTimeout`.
+     */
+    private fun armBackfillTimeout() {
+        handler.removeCallbacks(backfillTimeoutRunnable)
+        handler.postDelayed(backfillTimeoutRunnable, BACKFILL_IDLE_TIMEOUT_MS)
+    }
+
+    private fun onBackfillTimeout() {
+        backfiller.timeoutFired()
+        exitBackfilling("timeout")
+    }
+
+    /** Tear down the backfill session. Port of `exitBackfilling`. Does NOT auto-start live HR. */
+    private fun exitBackfilling(reason: String) {
+        if (!backfilling) return
+        backfilling = false
+        handler.removeCallbacks(backfillTimeoutRunnable)
+        backfillFrameQueue.clear()
+        log("Backfill: session ended — reason=$reason")
+    }
+
+    /**
+     * Ack one HISTORY_END chunk so the strap may trim it. Confirmed write (with response): the strap
+     * forgets the chunk once this lands (link-layer half of safe-trim; decoded already persisted).
+     *
+     * Ack form (matches the verified Mac offload): HISTORICAL_DATA_RESULT(23) payload =
+     * `[0x01] + end_data`, where end_data is the verbatim 8 bytes of the HISTORY_END
+     * metadata.data[10:18]. Port of `BLEManager.ackHistoricalChunk`.
+     */
+    private fun ackHistoricalChunk(trim: Long, endData: ByteArray) {
+        val payload = ByteArray(1 + endData.size)
+        payload[0] = 0x01
+        System.arraycopy(endData, 0, payload, 1, endData.size)
+        send(CommandNumber.HISTORICAL_DATA_RESULT, payload, withResponse = true)
+        log("Backfill: acked chunk trim=$trim")
+    }
+
+    // ====================================================================================
     // MARK: Disconnect / teardown  (port of didDisconnectPeripheral)
     // ====================================================================================
 
     @SuppressLint("MissingPermission")
     private fun handleDisconnect(status: Int) {
+        // Persist anything buffered before tearing down (port of the collector.flush() +
+        // flushStandardHR() calls in didDisconnectPeripheral). Runs on the IO scope.
+        ioScope.launch { flushLive(); flushStandardHr() }
+
         // Reset all per-connection state and clear UI flags.
         _state.value = _state.value.copy(connected = false, bonded = false)
         reset()
@@ -733,9 +1100,27 @@ class WhoopBleClient(private val context: Context) {
         cccdQueue.clear()
         writeInFlight = false
         cccdInFlight = false
+
+        // Reset offload state so the next connect starts a fresh session (port of the backfill
+        // flag resets in didDisconnectPeripheral). Timers are handler-posted, so cancel them here.
+        backfillStarted = false
+        backfilling = false
+        backfillDraining = false
+        backfillFrameQueue.clear()
+        strapNewestTs = null
+        handler.removeCallbacks(backfillTimeoutRunnable)
+        stopBackfillTimer()
         // NOTE: the Reassembler is intentionally NOT reset here — the Swift BLEManager reuses a
         // single `let reassembler` instance across reconnects too. Its SOF-resync loop (firstIndex
         // of 0xAA) self-recovers from any partial-frame remnant on the next fragment.
+    }
+
+    /**
+     * Permanently release this client's background scope. Call from the owner's teardown
+     * (e.g. AppViewModel.onCleared) AFTER [disconnect]. Idempotent.
+     */
+    fun shutdown() {
+        ioScope.cancel()
     }
 
     // ====================================================================================

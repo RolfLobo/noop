@@ -75,6 +75,10 @@ enum class CommandNumber(val rawValue: Int) {
     SET_CLOCK(10),
     GET_CLOCK(11),
     SEND_HISTORICAL_DATA(22),
+    // The historical-offload trim/ack command. Sent (with response) to confirm one HISTORY_END
+    // chunk so the strap may trim it; payload = [0x01] + the verbatim 8-byte HISTORY_END end_data.
+    // Port of Swift `WhoopCommand.historicalDataResult` (whoop_protocol.json: 23 HISTORICAL_DATA_RESULT).
+    HISTORICAL_DATA_RESULT(23),
     GET_BATTERY_LEVEL(26),
     GET_DATA_RANGE(34),
     GET_HELLO_HARVARD(35),

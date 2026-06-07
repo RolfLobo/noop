@@ -58,7 +58,8 @@ fun TrendsScreen(vm: AppViewModel) {
     // until it lands so the screen is populated on first frame when any data exists.
     var fullHistory by remember { mutableStateOf<List<DailyMetric>?>(null) }
     LaunchedEffect(Unit) {
-        fullHistory = vm.repo.days("my-whoop")
+        // Merged: imported WHOOP days win; on-device computed days gap-fill the trends.
+        fullHistory = vm.repo.daysMerged("my-whoop")
     }
     val days = fullHistory ?: reactiveDays
 

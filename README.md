@@ -148,15 +148,29 @@ wizard** (`Strand/Onboarding/OnboardingWizard.swift`).
 
 ## Platform status
 
-NOOP's logic lives in cross-platform Swift packages so the same protocol,
-storage, analytics, and import code can be reused on other platforms. Today the
-macOS app is the working reference implementation.
+NOOP's logic lives in cross-platform Swift packages, and the same protocol,
+storage, analytics, and scoring is ported to Kotlin on Android. Both apps pair
+with the strap and **score recovery, strain and sleep on your own device** — no
+import required.
 
 | Platform | Status |
 |---|---|
-| **macOS** | ✅ Working reference app (`Strand/`, SwiftUI, macOS 13+). The full feature set above runs here. |
+| **macOS** | ✅ Full app (`Strand/`, SwiftUI, macOS 13+). Pairs over BLE, offloads the strap's history, and scores recovery / strain / sleep on-device. The complete feature set above runs here. |
+| **Android** | ✅ Full app (`android/`, Jetpack Compose, Android 8+). Pairs over BLE, persists and scores on-device, and imports WHOOP / Apple Health / Health Connect. Grab the APK from [Releases](../../releases). |
 | **iOS** | 🟡 Libraries ready. Every package declares `.iOS(.v16)` and UI-framework code is guarded with `#if canImport(UIKit)` / `AppKit`; an iOS app target is planned. |
-| **Android** | ⏳ Planned. The protocol facts NOOP relies on are portable, but there is no Android target in this repository yet. |
+
+### What to expect when you start
+
+NOOP computes your scores on your own device, so like any recovery wearable it
+needs a little data before everything fills in:
+
+- **Live heart rate** shows the moment the strap connects.
+- **Strain and sleep** appear after you've worn it and synced — the strap's last
+  ~14 days offload automatically over the first few minutes.
+- **Recovery** needs a few nights for the app to learn your personal baseline,
+  then sharpens each night. WHOOP makes you wait for the same reason.
+- **In a hurry?** Import your WHOOP export in Data Sources and your full history
+  fills in about a minute.
 
 ---
 

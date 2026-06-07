@@ -458,7 +458,8 @@ private suspend fun loadFullSeries(
     if (metric.source == "my-whoop") {
         val pick = CompareCatalog.dailyPick(metric.key)
         if (pick != null) {
-            val all = vm.repo.days("my-whoop")
+            // Merged: imported WHOOP days win; on-device computed days gap-fill the series.
+            val all = vm.repo.daysMerged("my-whoop")
             val derived = if (all.isNotEmpty()) all else cachedDays
             return derived.mapNotNull { d -> pick(d)?.let { d.day to it } }.sortedBy { it.first }
         }

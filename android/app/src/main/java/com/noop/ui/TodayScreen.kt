@@ -60,10 +60,11 @@ fun TodayScreen(viewModel: AppViewModel, onSupport: () -> Unit = {}) {
         // below are explained rather than just dashed out.
         if (today?.recovery == null) {
             DataPendingNote(
-                title = "Live now. Your history is one import away.",
-                body = "Your live heart rate is working from the strap. To fill recovery, " +
-                    "strain, sleep and trends, import your WHOOP export in Data Sources. " +
-                    "It backfills your full history in about a minute.",
+                title = "Live now. Your scores are building.",
+                body = "Your live heart rate is working from the strap, and recovery, strain " +
+                    "and sleep build from it over your next few nights of wear, sharpening as it " +
+                    "learns your baseline. Want your full history instantly? Import your WHOOP " +
+                    "export in Data Sources and it backfills in about a minute.",
             )
         }
 

@@ -78,7 +78,9 @@ fun SleepScreen(vm: AppViewModel) {
         val now = System.currentTimeMillis() / 1000L
         val from = now - 60L * 24L * 60L * 60L // 60-day lookback
         session = runCatching {
-            vm.repo.sleepSessions("my-whoop", from, now, limit = 1).maxByOrNull { it.startTs }
+            // Merged: imported WHOOP sessions win per night; on-device computed
+            // ("my-whoop-noop") sessions gap-fill so strap-only nights still show a clock.
+            vm.repo.sleepSessionsMerged("my-whoop", from, now).maxByOrNull { it.startTs }
         }.getOrNull()
     }
 

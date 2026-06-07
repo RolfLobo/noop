@@ -4,17 +4,21 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.noop.analytics.IllnessWatch
+import com.noop.analytics.IntelligenceEngine
+import com.noop.analytics.UserProfile
 import com.noop.ble.LiveState
 import com.noop.ble.WhoopBleClient
 import com.noop.data.DailyMetric
 import com.noop.data.WhoopDatabase
 import com.noop.data.WhoopRepository
 import com.noop.protocol.CommandNumber
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -26,14 +30,22 @@ import kotlinx.coroutines.launch
  */
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
-    // BLE client — owns the GATT connection and emits LiveState.
-    val ble = WhoopBleClient(app.applicationContext)
-
     // Offline store.
     private val repository: WhoopRepository =
         WhoopRepository(WhoopDatabase.get(app.applicationContext).whoopDao())
 
+    // BLE client — owns the GATT connection, emits LiveState, AND persists decoded live + historical
+    // streams into [repository] (shares the same process-wide DB).
+    val ble = WhoopBleClient(app.applicationContext, repository = repository)
+
     val repo: WhoopRepository get() = repository
+
+    // Body profile (age/sex/weight/height + HR-max override) — the same SharedPreferences
+    // store the Settings screen edits. Feeds the on-device scorer's HRmax/zones/calories.
+    private val profileStore = ProfileStore.from(app.applicationContext)
+
+    /** The imported strap source id (raw streams + imported history live under this). */
+    private val deviceId = "my-whoop"
 
     /** Live connection + biometric snapshot, surfaced straight from the BLE client. */
     val live: StateFlow<LiveState> = ble.state
@@ -57,9 +69,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _today = MutableStateFlow<DailyMetric?>(null)
     val today: StateFlow<DailyMetric?> = _today.asStateFlow()
 
-    /** Recent daily metrics (newest last), backing the Today grid + illness watch. */
+    /**
+     * Recent daily metrics (newest last), backing the Today grid + illness watch.
+     * MERGED: imported "my-whoop" rows win per day; on-device computed "my-whoop-noop"
+     * rows (from [IntelligenceEngine]) gap-fill, so recovery/strain/sleep populate from
+     * the strap with no WHOOP import.
+     */
     val recentDays: StateFlow<List<DailyMetric>> =
-        repository.daysFlow("my-whoop")
+        repository.daysMergedFlow(deviceId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     init {
@@ -76,7 +93,36 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 _healthAlert.value = IllnessWatch.evaluate(days)
             }
         }
+
+        // Turn the strap's offloaded raw data into dashboard scores on launch and every
+        // 15 minutes, so recovery / strain / sleep populate from the strap itself with no
+        // import. IntelligenceEngine computes, persists under "my-whoop-noop", and the
+        // merged daysMergedFlow above republishes the freshly computed scores to the UI.
+        // Mirrors macOS AppModel's launch + 15-min analyze loop.
+        viewModelScope.launch {
+            delay(FIRST_OFFLOAD_GRACE_MS) // give the first offload a moment
+            while (isActive) {
+                runCatching {
+                    IntelligenceEngine.analyzeRecent(
+                        repo = repository,
+                        profile = currentProfile(),
+                        importedDeviceId = deviceId,
+                        maxHROverride = profileStore.hrMaxOverride
+                            .takeIf { it > 0 }?.toDouble(),
+                    )
+                }
+                delay(ANALYZE_INTERVAL_MS) // 15 min, matches the offload cadence
+            }
+        }
     }
+
+    /** Snapshot the user's body profile from SharedPreferences as an analytics [UserProfile]. */
+    private fun currentProfile(): UserProfile = UserProfile(
+        weightKg = profileStore.weightKg,
+        heightCm = profileStore.heightCm,
+        age = profileStore.age.toDouble(),
+        sex = profileStore.sex,
+    )
 
     // MARK: - HR smoothing (median filter)
 
@@ -113,5 +159,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         super.onCleared()
         ble.disconnect()
+        ble.shutdown()   // release the BLE client's background persistence scope
+    }
+
+    private companion object {
+        /** Grace before the first scoring pass, letting the first BLE offload land. */
+        const val FIRST_OFFLOAD_GRACE_MS = 6_000L
+        /** On-device scoring cadence — 15 min, matching the strap offload cadence. */
+        const val ANALYZE_INTERVAL_MS = 15 * 60 * 1_000L
     }
 }
